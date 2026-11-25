@@ -1,0 +1,65 @@
+
+services:
+  app:
+    build: .
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    depends_on:
+      - app
+    restart: unless-stopped
+
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    restart: unless-stopped
+
+
+  incident-engine:
+    build:
+      context: .
+      dockerfile: incident-engine/Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      PROMETHEUS_URL: "http://prometheus:9090"
+      INCIDENT_DB_PATH: "/data/incidents.db"
+    volumes:
+      - ./incident-engine/data:/data
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+
+
+volumes:
+  prometheus_data:
+  grafana_data:

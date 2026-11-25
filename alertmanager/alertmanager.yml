@@ -1,0 +1,16 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: "incident-engine"
+  group_by:
+    - alertname
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+
+receivers:
+  - name: "incident-engine"
+    webhook_configs:
+      - url: "http://incident-engine:8002/webhook"
+        send_resolved: true

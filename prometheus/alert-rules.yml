@@ -1,0 +1,41 @@
+
+groups:
+  - name: sre-aiops-alerts
+    rules:
+      - alert: ApplicationDown
+        expr: up{job="fastapi"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "FastAPI application is down"
+          description: "Prometheus cannot scrape the FastAPI application."
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(app_requests_total{http_status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(app_requests_total[5m])), 0.001)
+          ) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP 5xx error rate"
+          description: "More than 5% of requests are returning server errors."
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(app_request_duration_seconds_bucket[5m])
+            )
+          ) > 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High application latency"
+          description: "P95 response latency is above 1 second."
