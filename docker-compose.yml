@@ -52,6 +52,7 @@ services:
     environment:
       PROMETHEUS_URL: "http://prometheus:9090"
       INCIDENT_DB_PATH: "/data/incidents.db"
+      REMEDIATION_API_KEY: "${REMEDIATION_API_KEY}"
     volumes:
       - ./incident-engine/data:/data
     depends_on:

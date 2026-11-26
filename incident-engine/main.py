@@ -1,14 +1,20 @@
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Path as FastAPIPath, Query
+from fastapi.security import APIKeyHeader
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Literal
+import hashlib
 import logging
 import sqlite3
 import json
 import os
+import secrets
 from contextlib import contextmanager
+from pydantic import BaseModel, Field, StrictStr
 from analyzer import analyze_application
 from ai_investigator import investigate_incident
+from remediation import RemediationSimulator, validate_action_parameters
 
 app = FastAPI(
     title="SRE Incident Engine",
@@ -18,6 +24,46 @@ app = FastAPI(
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("incident-engine")
+
+remediation_api_key_header = APIKeyHeader(
+    name="X-API-Key",
+    auto_error=False,
+)
+
+
+def get_remediation_actor(
+    api_key: str | None = Depends(remediation_api_key_header),
+) -> str:
+    expected_api_key = os.getenv("REMEDIATION_API_KEY")
+    if (
+        not expected_api_key
+        or not expected_api_key.strip()
+        or not api_key
+        or not secrets.compare_digest(
+            api_key.encode("utf-8"),
+            expected_api_key.encode("utf-8"),
+        )
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+        )
+
+    return "api_operator"
+
+
+class RemediationProposalRequest(BaseModel):
+    action_key: StrictStr
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class RemediationDecisionRequest(BaseModel):
+    decision_note: StrictStr | None = Field(default=None, max_length=500)
+
+
+class _RemediationExecutionFailure(Exception):
+    pass
+
 
 # Store the database alongside this Python file.
 DB_PATH = Path(
@@ -33,6 +79,7 @@ def get_db_connection():
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     try:
+        connection.execute("PRAGMA foreign_keys = ON")
         with connection:
             yield connection
     finally:
@@ -182,6 +229,70 @@ def initialize_database():
                 ALTER TABLE incidents
                 ADD COLUMN investigation_json TEXT
             """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS remediation_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                incident_id INTEGER NOT NULL,
+                episode_starts_at TEXT NOT NULL,
+                action_key TEXT NOT NULL CHECK (
+                    action_key IN (
+                        'restart_application',
+                        'scale_application',
+                        'clear_application_cache'
+                    )
+                ),
+                parameters_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'pending_approval',
+                        'approved',
+                        'rejected',
+                        'executed',
+                        'execution_failed'
+                    )
+                ),
+                dedupe_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                proposed_by TEXT NOT NULL,
+                approved_at TEXT,
+                approved_by TEXT,
+                rejected_at TEXT,
+                rejected_by TEXT,
+                decision_note TEXT,
+                executed_at TEXT,
+                execution_result_json TEXT,
+                execution_error TEXT,
+                FOREIGN KEY (incident_id)
+                    REFERENCES incidents(id) ON DELETE RESTRICT
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS remediation_action_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY (action_id)
+                    REFERENCES remediation_actions(id) ON DELETE RESTRICT
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS simulator_state (
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS remediation_actions_incident_status_idx
+            ON remediation_actions (incident_id, status)
+        """)
 
     logger.info("Incident database initialized")
 
@@ -410,3 +521,681 @@ async def get_incidents():
         "incident_count": len(rows),
         "incidents": [dict(row) for row in rows]
     }
+
+
+@app.post("/incidents/{incident_id}/remediation-actions")
+async def create_remediation_action(
+    incident_id: int,
+    proposal: RemediationProposalRequest,
+    actor_id: str = Depends(get_remediation_actor),
+):
+    try:
+        parameters = validate_action_parameters(
+            proposal.action_key,
+            proposal.parameters,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    parameters_json = json.dumps(
+        parameters,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    with get_db_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        incident = connection.execute(
+            """
+            SELECT status, starts_at
+            FROM incidents
+            WHERE id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if incident is None:
+            raise HTTPException(status_code=404, detail="Incident not found")
+
+        episode_starts_at = incident["starts_at"]
+        if (
+            incident["status"] != "firing"
+            or not is_non_empty_string(episode_starts_at)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Incident is not eligible for remediation proposals",
+            )
+
+        dedupe_material = json.dumps(
+            [
+                incident_id,
+                episode_starts_at,
+                proposal.action_key,
+                parameters_json,
+            ],
+            separators=(",", ":"),
+        )
+        dedupe_key = hashlib.sha256(
+            dedupe_material.encode("utf-8")
+        ).hexdigest()
+        created_at = datetime.now(timezone.utc).isoformat()
+        cursor = connection.execute(
+            """
+            INSERT INTO remediation_actions (
+                incident_id,
+                episode_starts_at,
+                action_key,
+                parameters_json,
+                status,
+                dedupe_key,
+                created_at,
+                proposed_by
+            )
+            VALUES (?, ?, ?, ?, 'pending_approval', ?, ?, ?)
+            ON CONFLICT(dedupe_key) DO NOTHING
+            """,
+            (
+                incident_id,
+                episode_starts_at,
+                proposal.action_key,
+                parameters_json,
+                dedupe_key,
+                created_at,
+                actor_id,
+            ),
+        )
+
+        if cursor.rowcount == 1:
+            details_json = json.dumps(
+                {
+                    "action_key": proposal.action_key,
+                    "parameters": parameters,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                """
+                INSERT INTO remediation_action_events (
+                    action_id,
+                    event_type,
+                    actor_id,
+                    occurred_at,
+                    details_json
+                )
+                VALUES (?, 'proposal_created', ?, ?, ?)
+                """,
+                (
+                    cursor.lastrowid,
+                    actor_id,
+                    created_at,
+                    details_json,
+                ),
+            )
+
+        action = connection.execute(
+            """
+            SELECT
+                id,
+                incident_id,
+                episode_starts_at,
+                action_key,
+                parameters_json,
+                status,
+                created_at,
+                proposed_by
+            FROM remediation_actions
+            WHERE dedupe_key = ?
+            """,
+            (dedupe_key,),
+        ).fetchone()
+
+    return {
+        "id": action["id"],
+        "incident_id": action["incident_id"],
+        "episode_starts_at": action["episode_starts_at"],
+        "action_key": action["action_key"],
+        "parameters": json.loads(action["parameters_json"]),
+        "status": action["status"],
+        "created_at": action["created_at"],
+        "proposed_by": action["proposed_by"],
+    }
+
+
+def _serialize_remediation_action(row):
+    try:
+        parameters = json.loads(row["parameters_json"])
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=500,
+            detail="Stored remediation parameters are invalid",
+        ) from error
+    if not isinstance(parameters, dict):
+        raise HTTPException(
+            status_code=500,
+            detail="Stored remediation parameters are invalid",
+        )
+
+    return {
+        "id": row["id"],
+        "incident_id": row["incident_id"],
+        "episode_starts_at": row["episode_starts_at"],
+        "action_key": row["action_key"],
+        "parameters": parameters,
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "proposed_by": row["proposed_by"],
+        "approved_at": row["approved_at"],
+        "approved_by": row["approved_by"],
+        "rejected_at": row["rejected_at"],
+        "rejected_by": row["rejected_by"],
+        "decision_note": row["decision_note"],
+        "executed_at": row["executed_at"],
+    }
+
+
+@app.get("/remediation-actions")
+async def list_remediation_actions(
+    status: Literal[
+        "pending_approval",
+        "approved",
+        "rejected",
+        "executed",
+        "execution_failed",
+    ] | None = None,
+    incident_id: int | None = Query(default=None, gt=0),
+    _actor_id: str = Depends(get_remediation_actor),
+):
+    with get_db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                incident_id,
+                episode_starts_at,
+                action_key,
+                parameters_json,
+                status,
+                created_at,
+                proposed_by,
+                approved_at,
+                approved_by,
+                rejected_at,
+                rejected_by,
+                decision_note,
+                executed_at
+            FROM remediation_actions
+            WHERE (? IS NULL OR status = ?)
+                AND (? IS NULL OR incident_id = ?)
+            ORDER BY created_at DESC, id DESC
+            """,
+            (status, status, incident_id, incident_id),
+        ).fetchall()
+
+    actions = [_serialize_remediation_action(row) for row in rows]
+
+    return {
+        "action_count": len(actions),
+        "actions": actions,
+    }
+
+
+@app.get("/remediation-actions/{action_id}")
+async def get_remediation_action(
+    action_id: int = FastAPIPath(gt=0),
+    _actor_id: str = Depends(get_remediation_actor),
+):
+    with get_db_connection() as connection:
+        action = connection.execute(
+            """
+            SELECT
+                id,
+                incident_id,
+                episode_starts_at,
+                action_key,
+                parameters_json,
+                status,
+                created_at,
+                proposed_by,
+                approved_at,
+                approved_by,
+                rejected_at,
+                rejected_by,
+                decision_note,
+                executed_at
+            FROM remediation_actions
+            WHERE id = ?
+            """,
+            (action_id,),
+        ).fetchone()
+
+    if action is None:
+        raise HTTPException(status_code=404, detail="Remediation action not found")
+
+    return _serialize_remediation_action(action)
+
+
+@app.post("/remediation-actions/{action_id}/approve")
+async def approve_remediation_action(
+    action_id: int = FastAPIPath(gt=0),
+    decision: RemediationDecisionRequest = ...,
+    actor_id: str = Depends(get_remediation_actor),
+):
+    with get_db_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        action = connection.execute(
+            """
+            SELECT id, incident_id, episode_starts_at, status
+            FROM remediation_actions
+            WHERE id = ?
+            """,
+            (action_id,),
+        ).fetchone()
+
+        if action is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Remediation action not found",
+            )
+        if action["status"] != "pending_approval":
+            raise HTTPException(
+                status_code=409,
+                detail="Remediation action is not pending approval",
+            )
+
+        incident = connection.execute(
+            """
+            SELECT status, starts_at
+            FROM incidents
+            WHERE id = ?
+            """,
+            (action["incident_id"],),
+        ).fetchone()
+        if (
+            incident is None
+            or incident["status"] != "firing"
+            or incident["starts_at"] != action["episode_starts_at"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Incident is no longer eligible for approval",
+            )
+
+        decided_at = datetime.now(timezone.utc).isoformat()
+        cursor = connection.execute(
+            """
+            UPDATE remediation_actions
+            SET
+                status = 'approved',
+                approved_at = ?,
+                approved_by = ?,
+                decision_note = ?
+            WHERE id = ? AND status = 'pending_approval'
+            """,
+            (
+                decided_at,
+                actor_id,
+                decision.decision_note,
+                action_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Remediation action is not pending approval",
+            )
+
+        connection.execute(
+            """
+            INSERT INTO remediation_action_events (
+                action_id,
+                event_type,
+                actor_id,
+                occurred_at,
+                details_json
+            )
+            VALUES (?, 'approved', ?, ?, ?)
+            """,
+            (
+                action_id,
+                actor_id,
+                decided_at,
+                json.dumps(
+                    {"decision_note": decision.decision_note},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        updated_action = connection.execute(
+            """
+            SELECT
+                id,
+                incident_id,
+                episode_starts_at,
+                action_key,
+                parameters_json,
+                status,
+                created_at,
+                proposed_by,
+                approved_at,
+                approved_by,
+                rejected_at,
+                rejected_by,
+                decision_note,
+                executed_at
+            FROM remediation_actions
+            WHERE id = ?
+            """,
+            (action_id,),
+        ).fetchone()
+
+    return _serialize_remediation_action(updated_action)
+
+
+@app.post("/remediation-actions/{action_id}/reject")
+async def reject_remediation_action(
+    action_id: int = FastAPIPath(gt=0),
+    decision: RemediationDecisionRequest = ...,
+    actor_id: str = Depends(get_remediation_actor),
+):
+    with get_db_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        action = connection.execute(
+            """
+            SELECT id, status
+            FROM remediation_actions
+            WHERE id = ?
+            """,
+            (action_id,),
+        ).fetchone()
+
+        if action is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Remediation action not found",
+            )
+        if action["status"] != "pending_approval":
+            raise HTTPException(
+                status_code=409,
+                detail="Remediation action is not pending approval",
+            )
+
+        decided_at = datetime.now(timezone.utc).isoformat()
+        cursor = connection.execute(
+            """
+            UPDATE remediation_actions
+            SET
+                status = 'rejected',
+                rejected_at = ?,
+                rejected_by = ?,
+                decision_note = ?
+            WHERE id = ? AND status = 'pending_approval'
+            """,
+            (
+                decided_at,
+                actor_id,
+                decision.decision_note,
+                action_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Remediation action is not pending approval",
+            )
+
+        connection.execute(
+            """
+            INSERT INTO remediation_action_events (
+                action_id,
+                event_type,
+                actor_id,
+                occurred_at,
+                details_json
+            )
+            VALUES (?, 'rejected', ?, ?, ?)
+            """,
+            (
+                action_id,
+                actor_id,
+                decided_at,
+                json.dumps(
+                    {"decision_note": decision.decision_note},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        updated_action = connection.execute(
+            """
+            SELECT
+                id,
+                incident_id,
+                episode_starts_at,
+                action_key,
+                parameters_json,
+                status,
+                created_at,
+                proposed_by,
+                approved_at,
+                approved_by,
+                rejected_at,
+                rejected_by,
+                decision_note,
+                executed_at
+            FROM remediation_actions
+            WHERE id = ?
+            """,
+            (action_id,),
+        ).fetchone()
+
+    return _serialize_remediation_action(updated_action)
+
+
+def _record_remediation_execution_failure(action_id, actor_id):
+    executed_at = datetime.now(timezone.utc).isoformat()
+    safe_error = "Simulation failed"
+
+    with get_db_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            """
+            UPDATE remediation_actions
+            SET
+                status = 'execution_failed',
+                executed_at = ?,
+                execution_result_json = NULL,
+                execution_error = ?
+            WHERE id = ? AND status = 'approved'
+            """,
+            (executed_at, safe_error, action_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Remediation action is no longer approved",
+            )
+
+        connection.execute(
+            """
+            INSERT INTO remediation_action_events (
+                action_id,
+                event_type,
+                actor_id,
+                occurred_at,
+                details_json
+            )
+            VALUES (?, 'execution_failed', ?, ?, ?)
+            """,
+            (
+                action_id,
+                actor_id,
+                executed_at,
+                json.dumps(
+                    {"error": safe_error},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        action = connection.execute(
+            """
+            SELECT
+                id,
+                incident_id,
+                episode_starts_at,
+                action_key,
+                parameters_json,
+                status,
+                created_at,
+                proposed_by,
+                approved_at,
+                approved_by,
+                rejected_at,
+                rejected_by,
+                decision_note,
+                executed_at
+            FROM remediation_actions
+            WHERE id = ?
+            """,
+            (action_id,),
+        ).fetchone()
+
+    return _serialize_remediation_action(action)
+
+
+@app.post("/remediation-actions/{action_id}/execute")
+async def execute_remediation_action(
+    action_id: int = FastAPIPath(gt=0),
+    actor_id: str = Depends(get_remediation_actor),
+):
+    try:
+        with get_db_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            action = connection.execute(
+                """
+                SELECT
+                    id,
+                    incident_id,
+                    episode_starts_at,
+                    action_key,
+                    parameters_json,
+                    status
+                FROM remediation_actions
+                WHERE id = ?
+                """,
+                (action_id,),
+            ).fetchone()
+
+            if action is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Remediation action not found",
+                )
+            if action["status"] != "approved":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Remediation action is not approved",
+                )
+
+            incident = connection.execute(
+                """
+                SELECT status, starts_at
+                FROM incidents
+                WHERE id = ?
+                """,
+                (action["incident_id"],),
+            ).fetchone()
+            if (
+                incident is None
+                or incident["status"] != "firing"
+                or incident["starts_at"] != action["episode_starts_at"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Incident is no longer eligible for execution",
+                )
+
+            executed_at = datetime.now(timezone.utc).isoformat()
+            simulator = RemediationSimulator()
+            try:
+                result = simulator.simulate_with_state(
+                    connection,
+                    action["action_key"],
+                    json.loads(action["parameters_json"]),
+                    executed_at,
+                )
+                result_json = json.dumps(
+                    result,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except sqlite3.Error:
+                raise
+            except Exception as error:
+                raise _RemediationExecutionFailure from error
+
+            cursor = connection.execute(
+                """
+                UPDATE remediation_actions
+                SET
+                    status = 'executed',
+                    executed_at = ?,
+                    execution_result_json = ?,
+                    execution_error = NULL
+                WHERE id = ? AND status = 'approved'
+                """,
+                (executed_at, result_json, action_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Remediation action is no longer approved",
+                )
+
+            connection.execute(
+                """
+                INSERT INTO remediation_action_events (
+                    action_id,
+                    event_type,
+                    actor_id,
+                    occurred_at,
+                    details_json
+                )
+                VALUES (?, 'executed', ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    actor_id,
+                    executed_at,
+                    result_json,
+                ),
+            )
+            updated_action = connection.execute(
+                """
+                SELECT
+                    id,
+                    incident_id,
+                    episode_starts_at,
+                    action_key,
+                    parameters_json,
+                    status,
+                    created_at,
+                    proposed_by,
+                    approved_at,
+                    approved_by,
+                    rejected_at,
+                    rejected_by,
+                    decision_note,
+                    executed_at
+                FROM remediation_actions
+                WHERE id = ?
+                """,
+                (action_id,),
+            ).fetchone()
+    except _RemediationExecutionFailure:
+        return _record_remediation_execution_failure(action_id, actor_id)
+
+    return _serialize_remediation_action(updated_action)
